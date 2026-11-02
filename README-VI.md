@@ -1,11 +1,8 @@
 # RidgeKey Goodix 533c — bản tích hợp thử nghiệm
 
-Đã gộp toàn bộ sửa build Fix2–Fix4 vào source. Không cần áp dụng từng bản vá.
-README tiếng Anh là hướng dẫn kỹ thuật đầy đủ.
-
 ## Trạng thái
 
-Chủ máy Dell XPS 9500 / Goodix 27c6:533c báo đã build, cài, đăng ký, verify,
+Dell XPS 9500 / Goodix 27c6:533c báo đã build, cài, đăng ký, verify,
 giữ mẫu qua restart dịch vụ và mở khóa màn hình thành công; các ngón chưa đăng ký
 đã thử bị từ chối. Chỉ thử trên một máy, chưa có thống kê độ chính xác hoặc audit.
 Chưa ghi nhận riêng bài thử giữ mẫu qua reboot toàn máy.
@@ -45,10 +42,3 @@ cấp Accessibility cho RidgeKey Agent và thử Control-Command-Q.
 Disable-Unlock.command tắt tự nhập mật khẩu mà giữ các ngón đã lưu.
 Đây là agent nhập mật khẩu sau nhận diện, không phải Apple Touch ID/FileVault/Apple Pay.
 Không bật công cụ sudo/admin của upstream trong bản này.
-
-## Đưa lên GitHub
-
-Đưa toàn bộ nội dung thư mục repo lên một repository mới; giữ Source, patches,
-UPSTREAM.json và giấy phép. Không lấy EFI, log cá nhân hoặc Keychain để upload.
-Nếu cần binary cho GitHub Release, chạy Export-Release.command trên Dell đã build.
-Không cần build lại chỉ để xuất archive. Luôn kèm source tương ứng khi chia sẻ binary.
