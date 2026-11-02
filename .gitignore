@@ -1,0 +1,23 @@
+# Generated artifacts and private local state
+.DS_Store
+/ridgekey-biostore-check
+/ridgekey-biostore-reader
+._*
+__pycache__/
+*.pyc
+Build-Output/
+Releases/
+bundle-path.txt
+Build-*.txt
+Finish-*.txt
+Keychain-*.txt
+Collect-*.txt
+Persistence-*.txt
+.script-fix*-backup-*/
+Source/**/_build/
+Source/**/build/
+*.print
+*.keychain
+*.keychain-db
+*.p12
+*.pem

@@ -1,0 +1,196 @@
+#!/bin/bash
+# ridgekey-sign - sign ridgekey-agent with a stable, machine-local code-signing certificate.
+#
+# Why: macOS ties the Accessibility permission to the agent's code signature. CI builds are
+# ad-hoc signed (no certificate), so every upgrade looked like a new app and Accessibility had
+# to be granted again. Signed with the same local certificate, every build has the same
+# designated requirement (identifier + certificate), and the permission survives upgrades.
+#
+#   sudo ridgekey-sign sign [FILE]     create the certificate on first use, then sign FILE
+#                                      (default /usr/local/ridgekey/RidgeKeyAgent.app)
+#   sudo ridgekey-sign status
+#   sudo ridgekey-sign remove          delete the certificate and its keychain (uninstall --purge)
+#
+# The certificate is self-signed, code-signing only, and created on this Mac. Its private key
+# lives in a separate keychain under /Library/Application Support/RidgeKey, readable only by
+# root (whoever is root could replace the agent anyway). It never leaves this machine.
+# On any failure the file keeps its existing (ad-hoc) signature: RidgeKey still works, you just
+# have to grant Accessibility again after upgrades.
+set -euo pipefail
+
+DIR="${RK_SIGN_DIR:-/Library/Application Support/RidgeKey}"
+KC="$DIR/signing.keychain-db"
+PWF="$DIR/signing.keychain.pw"
+CN="RidgeKey Local Code Signing"
+IDENT="io.github.labrouss.ridgekey.agent"
+TARGET="${2:-/usr/local/ridgekey/RidgeKeyAgent.app}"
+
+TMPD=""
+cleanup() { [ -n "$TMPD" ] && rm -rf "$TMPD"; return 0; }
+trap cleanup EXIT
+die() { echo "ridgekey-sign: $*" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || die "run with sudo"
+
+kc_unlock() { security unlock-keychain -p "$(cat "$PWF")" "$KC" >/dev/null 2>&1; }
+
+cert_hash() {
+  security find-certificate -c "$CN" -Z "$KC" 2>/dev/null | awk '/SHA-1 hash:/ {print $NF; exit}'
+}
+
+create_identity() {
+  local tmp pw
+  echo "    creating the local code-signing certificate (once per Mac)"
+  mkdir -p "$DIR"
+  chmod 755 "$DIR"
+  TMPD="$(mktemp -d)"
+  tmp="$TMPD"
+  chmod 700 "$tmp"
+
+  local host
+  host="$(scutil --get LocalHostName 2>/dev/null || hostname -s)"
+  host="${host//[^A-Za-z0-9._-]/}"     # plain characters only in the certificate
+  write_cnf() {   # $1 = full | minimal
+    {
+      echo "[req]"
+      echo "distinguished_name = dn"
+      echo "prompt = no"
+      echo "x509_extensions = ext"
+      echo "[dn]"
+      echo "CN = $CN"                 # X.509 limits CN to 64 characters - keep it fixed
+      echo "OU = ${host:0:60}"        # which Mac created it (truncated to fit)
+      echo "[ext]"
+      if [ "$1" = full ]; then
+        echo "basicConstraints = critical,CA:FALSE"
+        echo "keyUsage = critical,digitalSignature"
+        echo "extendedKeyUsage = critical,codeSigning"
+        echo "subjectKeyIdentifier = hash"
+      else
+        echo "keyUsage = digitalSignature"
+        echo "extendedKeyUsage = codeSigning"
+      fi
+    } > "$tmp/req.cnf"
+  }
+  make_cert() {   # $1 = validity in days
+    /usr/bin/openssl req -x509 -newkey rsa:3072 -nodes -days "$1" -sha256 \
+      -config "$tmp/req.cnf" -keyout "$tmp/key.pem" -out "$tmp/cert.pem" > "$tmp/openssl.log" 2>&1
+  }
+  write_cnf full
+  if ! make_cert 7300; then
+    echo "    openssl ($(/usr/bin/openssl version 2>/dev/null)) refused the full settings:"
+    sed 's/^/      /' "$tmp/openssl.log" | head -8
+    echo "    retrying with minimal code-signing settings"
+    write_cnf minimal
+    make_cert 3650 || { sed 's/^/      /' "$tmp/openssl.log" | head -8; die "openssl could not create the certificate"; }
+  fi
+  # 3DES/SHA1 PKCS#12: the format macOS `security import` reliably reads (LibreSSL's default;
+  # OpenSSL 3 would otherwise use AES/PBES2)
+  /usr/bin/openssl pkcs12 -export -inkey "$tmp/key.pem" -in "$tmp/cert.pem" \
+    -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 \
+    -name "$CN" -out "$tmp/id.p12" -passout pass:ridgekey > "$tmp/openssl.log" 2>&1 \
+    || { sed 's/^/      /' "$tmp/openssl.log" | head -8; die "openssl could not package the certificate"; }
+
+  pw="$(/usr/bin/openssl rand -hex 32)"
+  ( umask 077; printf '%s' "$pw" > "$PWF" )
+  chown root:wheel "$PWF"
+  chmod 600 "$PWF"
+  rm -f "$KC"
+  security create-keychain -p "$pw" "$KC" >/dev/null
+  security set-keychain-settings "$KC"            # no auto-lock
+  kc_unlock
+  security import "$tmp/id.p12" -k "$KC" -P ridgekey -T /usr/bin/codesign >/dev/null \
+    || die "could not import the identity"
+  security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$pw" "$KC" >/dev/null 2>&1 || true
+  chown root:wheel "$KC"
+  chmod 600 "$KC"
+  rm -rf "$tmp"
+  TMPD=""
+  echo "    certificate $(cert_hash)"
+}
+
+# Try one way of signing; on failure show codesign's own message.
+try_codesign() {   # $1 = label, rest = extra codesign args
+  local label=$1; shift
+  if codesign --force "$@" --sign "$HASH" --options runtime --identifier "$IDENT" "$TARGET" \
+       > "$LOG" 2>&1; then
+    return 0
+  fi
+  echo "    codesign failed ($label):"
+  sed 's/^/      /' "$LOG" | head -5
+  return 1
+}
+
+do_sign() {
+  local cert old_list
+  [ -e "$TARGET" ] || die "$TARGET not found"
+  if [ ! -f "$KC" ] || [ ! -f "$PWF" ] || ! kc_unlock || [ -z "$(cert_hash)" ]; then
+    create_identity
+  fi
+  kc_unlock || die "cannot unlock $KC"
+  HASH="$(cert_hash)"
+  [ -n "$HASH" ] || die "certificate not found in $KC"
+  TMPD="$(mktemp -d)"
+  LOG="$TMPD/codesign.log"
+  cert="$TMPD/cert.pem"
+  security find-certificate -c "$CN" -p "$KC" > "$cert"
+
+  # codesign only finds identities in keychains on the search list (confirmed on Tahoe:
+  # "--keychain" alone gives "no identity found"), so put ours on root's list for this call
+  # and restore it afterwards. No trust setting is needed.
+  old_list="$(security list-keychains -d user)"
+  security list-keychains -d user -s "$KC" /Library/Keychains/System.keychain >/dev/null 2>&1 || true
+  if ! try_codesign "keychain on the search list" --keychain "$KC"; then
+    # fallback: some systems may insist on a trusted identity - trust it for code signing
+    # only, in root's own trust settings (no machine-wide change, no authorization dialog)
+    security add-trusted-cert -r trustRoot -p codeSign -k "$KC" "$cert" > "$LOG" 2>&1 \
+      || { echo "    could not add code-signing trust:"; sed 's/^/      /' "$LOG" | head -3; }
+    if ! try_codesign "trusted for code signing" --keychain "$KC"; then
+      echo "    identities codesign can see:"
+      security find-identity -p codesigning "$KC" 2>&1 | sed 's/^/      /' | head -6
+      restore_search_list "$old_list"
+      die "codesign failed (the file keeps its previous signature)"
+    fi
+  fi
+  restore_search_list "$old_list"
+  codesign --verify --strict "$TARGET" >/dev/null 2>&1 || die "signature does not verify"
+  codesign -dr - "$TARGET" 2>&1 | grep 'certificate leaf' >/dev/null || die "unexpected designated requirement"
+  echo "    signed $(basename "$TARGET") with the local certificate (${HASH:0:12}...)"
+}
+
+# Put root's keychain search list back as it was (entries are quoted, may contain spaces).
+restore_search_list() {
+  local -a list=()
+  local line
+  while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"   # trim leading blanks
+    line="${line%\"}"; line="${line#\"}"       # strip quotes
+    [ -n "$line" ] && list+=("$line")
+  done <<< "$1"
+  if [ ${#list[@]} -gt 0 ]; then
+    security list-keychains -d user -s "${list[@]}" >/dev/null 2>&1 || true
+  fi
+}
+
+do_status() {
+  if [ -f "$KC" ] && kc_unlock && [ -n "$(cert_hash)" ]; then
+    echo "local certificate: $(cert_hash)"
+  else
+    echo "local certificate: none"
+  fi
+  if [ -e "$TARGET" ]; then
+    echo "$(basename "$TARGET"):"
+    codesign -dr - "$TARGET" 2>&1 | sed -n 's/^designated => /  requirement: /p'
+    codesign -dv "$TARGET" 2>&1 | sed -n 's/^\(CodeDirectory.*flags=[^ ]*\).*/  \1/p'
+  fi
+}
+
+do_remove() {
+  rm -f "$KC" "$PWF"
+  echo "removed the local code-signing certificate"
+}
+
+case "${1:-status}" in
+  sign)   do_sign ;;
+  status) do_status ;;
+  remove) do_remove ;;
+  *)      echo "usage: ridgekey-sign sign [FILE] | status | remove"; exit 2 ;;
+esac

@@ -1,0 +1,10 @@
+* text=auto eol=lf
+*.command text eol=lf
+*.sh text eol=lf
+*.patch -text
+*.png binary
+*.icns binary
+*.ioctl binary
+*.pcapng binary
+ridgekey-biostore-check binary
+ridgekey-biostore-reader binary

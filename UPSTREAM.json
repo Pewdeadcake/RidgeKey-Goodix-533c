@@ -1,0 +1,25 @@
+{
+  "version": "1.0.5331",
+  "sources": {
+    "RidgeKey": {
+      "url": "https://github.com/labrouss/RidgeKey",
+      "commit": "4968672f775c119e96a9f7e5041536e801069aab",
+      "license": "MIT"
+    },
+    "goodix533c": {
+      "url": "https://github.com/nikicat/goodix53x5-libfprint",
+      "commit": "52584a593d29e1cf8b317f53cb46c54396a3e4f1",
+      "license": "LGPL-2.1-or-later (per upstream README)"
+    },
+    "libfprint": {
+      "url": "https://gitlab.freedesktop.org/libfprint/libfprint",
+      "commit": "0c97a47d8ef405cd577b87058c1e89cae9d242e7",
+      "license": "LGPL-2.1-or-later"
+    }
+  },
+  "additionalBuildPins": {
+    "openssl": "45e844fa2a14ec92d146bd8f5778ac130b6625fb",
+    "libdeflate": "92e6a0db9fa848d742f9eb286c92afc60f2c3dda"
+  },
+  "vendoring": "Source contains the integrated source, not a git submodule. Original histories are linked above."
+}

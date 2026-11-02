@@ -1,0 +1,816 @@
+#!/usr/bin/env python3
+"""Corpus-agnostic profile-9 Milan historical authority runner."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+CORPUS_SCHEMA = "milan-parity-corpus/v1"
+CASE_SCHEMA = "milan-parity-case/v1"
+RECORD_SCHEMA = "milan-parity-record/v1"
+NATIVE_REPLAY_SCHEMA = "milan-parity-native-replay/v1"
+NATIVE_BATCH_SCHEMA = "milan-parity-native-batch/v1"
+NATIVE_PROVENANCE_SCHEMA = "milan-parity-native-provenance/v1"
+AUTHORITY_MODEL = "canonical-zero-layered-v1"
+EXECUTION_MODE = "natural-identify-study-v1"
+POLICY = {
+    "anti_fake_mode": 1,
+    "boundary_policy": "canonical-zero-v1",
+    "print_schema": 4,
+    "profile": 9,
+    "subtype": 12,
+}
+CALIBRATION_FIELDS = ("tcode", "dac_high", "dac_low")
+UINT32_MAX = 0xFFFFFFFF
+PREPROCESS_RETRY_STATUSES = {0x29AA, 0x29BB, 0x7531, 0xC351}
+AUTHORITY_COMMIT = "be2e3ae78ce5942006155aae9dc97e6462f115a2"
+
+
+class RunnerError(RuntimeError):
+    pass
+
+
+def canonical(value) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=True) + "\n").encode("ascii")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def require_digest(value: str | None, label: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise RunnerError(f"{label} must be a lowercase SHA-256")
+    return value
+
+
+def load_canonical(path: Path, label: str):
+    try:
+        raw = path.read_bytes()
+        value = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as error:
+        raise RunnerError(f"cannot read {label}: {error}") from error
+    if raw != canonical(value):
+        raise RunnerError(f"{label} is not canonical JSON")
+    return value
+
+
+def load_json(path: Path, label: str):
+    try:
+        return json.loads(path.read_bytes())
+    except (OSError, json.JSONDecodeError) as error:
+        raise RunnerError(f"cannot read {label}: {error}") from error
+
+
+def require_object(value, label: str):
+    if not isinstance(value, dict):
+        raise RunnerError(f"{label} must be an object")
+    return value
+
+
+def contained(root: Path, relative: str, label: str) -> Path:
+    if not isinstance(relative, str):
+        raise RunnerError(f"{label} path must be a string")
+    member = Path(relative)
+    if member.is_absolute() or ".." in member.parts:
+        raise RunnerError(f"{label} path must be relative and contained")
+    unresolved = root / member
+    current = root
+    for part in member.parts:
+        current = current / part
+        if current.is_symlink():
+            raise RunnerError(f"{label} must not traverse a symlink")
+    resolved = unresolved.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as error:
+        raise RunnerError(f"{label} escapes the corpus") from error
+    return resolved
+
+
+def verify_artifact(root: Path, artifact, label: str) -> Path:
+    artifact = require_object(artifact, label)
+    if set(("path", "sha256", "bytes")) - artifact.keys():
+        raise RunnerError(f"{label} is missing path, sha256, or bytes")
+    if (not isinstance(artifact["sha256"], str) or
+            not re.fullmatch(r"[0-9a-f]{64}", artifact["sha256"]) or
+            not isinstance(artifact["bytes"], int) or artifact["bytes"] < 0):
+        raise RunnerError(f"{label} has an invalid identity")
+    path = contained(root, artifact["path"], label)
+    try:
+        metadata = path.stat()
+    except OSError as error:
+        raise RunnerError(f"{label} is unavailable: {error}") from error
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_size != artifact["bytes"] or
+            sha256_file(path) != artifact["sha256"]):
+        raise RunnerError(f"{label} identity differs")
+    return path
+
+
+def load_case(root: Path, case_id: str):
+    try:
+        metadata = root.stat()
+    except OSError as error:
+        raise RunnerError(f"corpus root is unavailable: {error}") from error
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise RunnerError("corpus root is not a directory")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", case_id):
+        raise RunnerError("case ID is invalid")
+    corpus = require_object(load_canonical(root / "corpus.json", "corpus.json"),
+                            "corpus")
+    if corpus.get("schema") != CORPUS_SCHEMA or corpus.get("policy") != POLICY:
+        raise RunnerError("corpus schema or fixed profile-9 policy differs")
+    descriptors = corpus.get("cases")
+    if not isinstance(descriptors, list):
+        raise RunnerError("corpus cases must be an array")
+    selected = [item for item in descriptors
+                if isinstance(item, dict) and item.get("id") == case_id]
+    if len(selected) != 1:
+        raise RunnerError(f"case {case_id} is absent or duplicated")
+    input_path = contained(root, selected[0].get("input"), "case input")
+    case = require_object(load_canonical(input_path, f"case {case_id} input.json"),
+                          f"case {case_id}")
+    if (case.get("schema") != CASE_SCHEMA or case.get("id") != case_id or
+            case.get("policy") != POLICY):
+        raise RunnerError("case schema, identity, or fixed profile-9 policy differs")
+    device = require_object(case.get("device"), "case device")
+    if device.get("width") != 108 or device.get("height") != 88:
+        raise RunnerError("case dimensions must be 108x88")
+    artifacts = require_object(case.get("artifacts"), "case artifacts")
+    verified = {name: verify_artifact(root, artifact, f"artifact {name}")
+                for name, artifact in artifacts.items()}
+    return case, verified
+
+
+def artifact(verified: dict[str, Path], name, label: str) -> Path:
+    if not isinstance(name, str) or name not in verified:
+        raise RunnerError(f"{label} must name an explicit case artifact")
+    return verified[name]
+
+
+def native_contract(case, verified: dict[str, Path]):
+    replay = require_object(case.get("replay"), "case replay")
+    native = require_object(replay.get("native"), "case replay.native")
+    if (native.get("schema") != NATIVE_REPLAY_SCHEMA or
+            native.get("authority_model") != AUTHORITY_MODEL):
+        raise RunnerError(
+            "case replay.native must select milan-parity-native-replay/v1 "
+            "and canonical-zero-layered-v1")
+    dll_digest = native.get("dll_sha256")
+    if not isinstance(dll_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", dll_digest):
+        raise RunnerError("case replay.native.dll_sha256 must pin the DLL identity")
+    purpose = replay.get("purpose")
+    operation = case.get("operation")
+    if operation not in {"verify", "identify", "study", "persistence"}:
+        raise RunnerError(f"native DLL runner does not support operation {operation!r}")
+    if purpose != "identify":
+        raise RunnerError("identify/study replay purpose must be identify")
+    for field in CALIBRATION_FIELDS:
+        value = replay.get(field)
+        if type(value) is not int or not 0 <= value <= 0xFFFF:
+            raise RunnerError(f"replay {field} must be a uint16")
+    setup = artifact(verified, replay.get("setup"), "replay setup")
+    live_names = replay.get("live")
+    if not isinstance(live_names, list) or len(live_names) != 1:
+        raise RunnerError("DLL identify/study authority requires exactly one live artifact")
+    live = artifact(verified, live_names[0], "replay live")
+    prelude_names = replay.get("prelude", [])
+    if (not isinstance(prelude_names, list) or len(prelude_names) > 255 or
+            any(not isinstance(name, str) for name in prelude_names)):
+        raise RunnerError("DLL identify/study prelude must be an artifact-name array")
+    if "prelude_purposes" not in replay:
+        raise RunnerError("DLL identify/study replay.prelude_purposes is required")
+    prelude_purposes = replay["prelude_purposes"]
+    if (not isinstance(prelude_purposes, list) or
+            len(prelude_purposes) != len(prelude_names) or
+            any(not isinstance(purpose, int) or isinstance(purpose, bool) or
+                purpose not in {0, 1} for purpose in prelude_purposes)):
+        raise RunnerError(
+            "DLL identify/study prelude_purposes must be a same-length "
+            "integer array containing only zero or one")
+    preludes = [(artifact(verified, name, f"replay prelude {position}"), purpose)
+                for position, (name, purpose) in
+                enumerate(zip(prelude_names, prelude_purposes))]
+    gallery = replay.get("gallery")
+    if not isinstance(gallery, list) or not gallery:
+        raise RunnerError("DLL identify/study authority requires an explicit gallery")
+    entries = []
+    for position, entry in enumerate(gallery):
+        if not isinstance(entry, dict):
+            raise RunnerError(f"gallery entry {position} must be an object")
+        index = entry.get("index")
+        if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index <= UINT32_MAX:
+            raise RunnerError(f"gallery entry {position} index must be a uint32")
+        template = artifact(verified, entry.get("artifact"),
+                            f"replay gallery entry {position}")
+        entries.append((setup, preludes, live, template, index))
+    return replay, native, entries
+
+
+def verify_dll(path: Path, expected: str) -> None:
+    try:
+        metadata = path.stat()
+    except OSError as error:
+        raise RunnerError(f"explicit DLL is unavailable: {error}") from error
+    if (not stat.S_ISREG(metadata.st_mode) or path.is_symlink() or
+            sha256_file(path) != expected):
+        raise RunnerError("explicit DLL SHA-256 differs from case replay metadata")
+
+
+def validate_record(value, case_id: str, label: str):
+    value = require_object(value, label)
+    if (value.get("schema") != RECORD_SCHEMA or value.get("case_id") != case_id or
+            value.get("policy") != POLICY or not isinstance(value.get("result"), dict)):
+        raise RunnerError(f"{label} identity or policy differs")
+    phases = value.get("phases")
+    if not isinstance(phases, list) or not phases:
+        raise RunnerError(f"{label} phases must be non-empty")
+    names = []
+    for phase in phases:
+        if (not isinstance(phase, dict) or not isinstance(phase.get("name"), str) or
+                not isinstance(phase.get("outputs"), dict)):
+            raise RunnerError(f"{label} contains an invalid phase")
+        names.append(phase["name"])
+    if len(names) != len(set(names)):
+        raise RunnerError(f"{label} contains duplicate phase names")
+    validate_record_privacy(value, label)
+    return value
+
+
+def validate_record_privacy(value, label: str, key: str = "") -> None:
+    if isinstance(value, dict):
+        for child_key, child in value.items():
+            if not isinstance(child_key, str):
+                raise RunnerError(f"{label} contains a non-string key")
+            validate_record_privacy(child, label, child_key)
+    elif isinstance(value, list):
+        if len(value) > 256:
+            raise RunnerError(f"{label} contains an oversized array")
+        for child in value:
+            validate_record_privacy(child, label, key)
+    elif isinstance(value, str):
+        if len(value) > 1024:
+            raise RunnerError(f"{label} contains oversized text")
+        if key.lower() in {"image_bytes", "template_bytes", "payload", "raw_bytes"}:
+            raise RunnerError(f"{label} embeds private biometric bytes")
+    elif value is not None and not isinstance(value, (bool, int)):
+        raise RunnerError(f"{label} contains a non-canonical scalar")
+
+
+def cache_root() -> Path:
+    root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "milan-parity"
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(root, 0o700)
+    return root
+
+
+def native_source_sha256(tool: Path) -> str:
+    sources = [Path(__file__).resolve(), tool / "native" / "native-oracle.c",
+               tool / "build-native-runner"]
+    digest = hashlib.sha256()
+    for source in sources:
+        digest.update(source.name.encode("ascii"))
+        digest.update(source.read_bytes())
+    return digest.hexdigest()
+
+
+def backend_executable(tool: Path, *, build: bool) -> Path:
+    source = tool / "native" / "native-oracle.c"
+    build_script = tool / "build-native-runner"
+    digest = hashlib.sha256(source.read_bytes() + build_script.read_bytes()).hexdigest()
+    directory = cache_root() / "native-builds" / digest
+    executable = directory / "native-oracle.exe"
+    if executable.is_symlink():
+        raise RunnerError(f"native oracle backend must not be a symlink: {executable}")
+    if executable.is_file() and os.access(executable, os.X_OK):
+        return executable
+    if executable.exists():
+        raise RunnerError(f"native oracle backend is not an executable file: {executable}")
+    if not build:
+        raise RunnerError(
+            "native oracle backend is absent; run native-runner --provenance first")
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = directory / f".native-oracle-{os.getpid()}.exe"
+    try:
+        process = subprocess.run((str(build_script), "--output", str(temporary)),
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 check=False, timeout=120)
+        if process.returncode or not temporary.is_file():
+            raise RunnerError(f"MinGW native oracle build failed with status {process.returncode}")
+        os.replace(temporary, executable)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return executable
+
+
+def wine_executable(expected_version: str | None = None) -> tuple[str, str]:
+    wine_value = os.environ.get("MILAN_PARITY_WINE", "wine")
+    wine = shutil.which(wine_value)
+    if not wine:
+        raise RunnerError("Wine executable is unavailable")
+    version = subprocess.run((wine, "--version"), stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, check=True, timeout=30).stdout.decode(
+                                 "ascii", "strict").strip()
+    if expected_version is not None and version != expected_version:
+        raise RunnerError("Wine version differs from pinned provenance")
+    return wine, version
+
+
+def provenance(tool: Path, dll_value: str | None, *, build_backend: bool):
+    if not dll_value:
+        raise RunnerError("--provenance requires explicit --dll PATH")
+    dll = Path(dll_value).expanduser().resolve()
+    if not dll.is_file() or dll.is_symlink():
+        raise RunnerError("explicit DLL is unavailable for provenance")
+    _, version = wine_executable()
+    backend = backend_executable(tool, build=build_backend)
+    return {
+        "architecture": "win64-x86_64",
+        "authority_commit": AUTHORITY_COMMIT,
+        "dll_sha256": sha256_file(dll),
+        "execution_mode": EXECUTION_MODE,
+        "native_build_sha256": sha256_file(backend),
+        "native_source_sha256": native_source_sha256(tool),
+        "policy": POLICY,
+        "schema": NATIVE_PROVENANCE_SCHEMA,
+        "wine_version": version,
+    }
+
+
+def wine_prefix(native) -> Path:
+    value = native.get("wine_prefix")
+    if value is None:
+        value = os.environ.get("MILAN_PARITY_WINEPREFIX") or os.environ.get("WINEPREFIX")
+    if not isinstance(value, str) or not value:
+        raise RunnerError(
+            "an existing Wine prefix is required via replay.native.wine_prefix, "
+            "MILAN_PARITY_WINEPREFIX, or WINEPREFIX; native-runner never initializes one")
+    prefix = Path(value).expanduser()
+    if not prefix.is_absolute():
+        raise RunnerError("Wine prefix path must be absolute")
+    prefix = prefix.resolve()
+    if not prefix.is_dir() or not (prefix / "system.reg").is_file():
+        raise RunnerError("Wine prefix does not exist or is not initialized")
+    z_drive = prefix / "dosdevices" / "z:"
+    if not z_drive.is_symlink() or z_drive.resolve() != Path("/"):
+        raise RunnerError("existing Wine prefix must expose its standard z: root mapping")
+    return prefix
+
+
+def windows_path(path: Path) -> str:
+    return "Z:" + str(path.resolve()).replace("/", "\\")
+
+
+def output_identity(path: Path):
+    try:
+        size = path.stat().st_size
+    except OSError as error:
+        raise RunnerError("Wine oracle omitted a required output") from error
+    return size, sha256_file(path)
+
+
+def record_from_output(output: Path, case, inputs):
+    _, preludes, _, template, gallery_index = inputs
+    oracle = require_object(load_json(output / "oracle-result.json",
+                                      "Wine oracle result"),
+                            "Wine oracle result")
+    preprocess = require_object(oracle.get("preprocess"), "Wine preprocess result")
+    lifecycle = require_object(oracle.get("lifecycle"), "Wine lifecycle result")
+    if set(lifecycle) != {"extraction", "preprocess", "study"}:
+        raise RunnerError("Wine lifecycle stages differ")
+    for name, value in lifecycle.items():
+        value = require_object(value, f"Wine lifecycle {name}")
+        if (set(value) != {"attempted", "completed"} or
+                type(value.get("attempted")) is not bool or
+                type(value.get("completed")) is not bool or
+                (value["completed"] and not value["attempted"])):
+            raise RunnerError(f"Wine lifecycle {name} is invalid")
+    if lifecycle["preprocess"] == {"attempted": True, "completed": False}:
+        expected_retry_contract = {
+            "schema": "milan-parity-native-oracle/v1", "profile": 9,
+            "subtype": 12, "purpose": 0, "anti_fake_mode": 1,
+            "recognition_mode": 1, "normal_extraction": False,
+            "normal_antifake": False, "prelude_frames": len(preludes),
+            "hook_hits": 0, "execution_mode": EXECUTION_MODE,
+            "preprocessor_exit_status": 0,
+        }
+        if any(oracle.get(key) != value
+               for key, value in expected_retry_contract.items()):
+            raise RunnerError("Wine oracle retry contract differs")
+        preprocess_status = preprocess.get("status")
+        preprocess_quality = preprocess.get("quality")
+        preprocess_coverage = preprocess.get("coverage")
+        processed_hash = None
+        expected_outputs = {"oracle-result.json"}
+        if preprocess_status == 0xC351:
+            processed_size, processed_hash = output_identity(output / "processed.u8")
+            if processed_size != 108 * 88:
+                raise RunnerError("Wine classification retry image size differs")
+            expected_outputs.add("processed.u8")
+        if (preprocess_status not in PREPROCESS_RETRY_STATUSES or
+                (preprocess_status in {0x29AA, 0x29BB} and
+                 (preprocess_quality != 0 or preprocess_coverage != 0)) or
+                lifecycle["extraction"] != {"attempted": False, "completed": False} or
+                lifecycle["study"] != {"attempted": False, "completed": False} or
+                {path.name for path in output.iterdir()} != expected_outputs):
+            raise RunnerError("Wine preprocessing retry lifecycle is inconsistent")
+        phases = [
+            {"name": "stage-01-preprocess",
+             "outputs": {"coverage_i32": preprocess_coverage,
+                          "processed_image_sha256": processed_hash,
+                          "quality_i32": preprocess_quality,
+                          "status_i32": preprocess_status}},
+            {"name": "stage-01-extract-antifake",
+             "outputs": {"active_record_count_u32": None,
+                         "partition0_count_u32": None,
+                         "partition1_count_u32": None,
+                         "probe_record_count_u32": None,
+                         "probe_template_sha256": None}},
+            {"name": "stage-01-study",
+             "outputs": {"final_candidate_sha256": None,
+                         "study_action_u32": None}},
+        ]
+        record = {
+            "schema": RECORD_SCHEMA, "case_id": case["id"],
+            "execution_mode": EXECUTION_MODE, "policy": POLICY,
+            "phases": phases,
+            "result": {"accepted": False, "final_candidate_sha256": None,
+                       "gallery": [], "lifecycle": lifecycle, "score_i32": 0,
+                       "status_u32": 2, "study_action_u32": None,
+                       "winner_index_u32": UINT32_MAX,
+                       "winner_position_u32": UINT32_MAX},
+        }
+        return validate_record(record, case["id"], "native DLL retry record")
+    expected_contract = {
+        "schema": "milan-parity-native-oracle/v1", "profile": 9,
+        "subtype": 12, "purpose": 0, "anti_fake_mode": 1,
+        "recognition_mode": 1, "normal_extraction": True,
+        "normal_antifake": True, "source_index": 2288, "sentinel": 0,
+        "in_range_bytes_preserved": True, "shadow_payload_bytes": 2289,
+        "matrix_header_size_field": 2288, "dll_allocator_owned": True,
+        "normal_destructor_compatible": True, "prelude_frames": len(preludes),
+        "hook_hits": 1,
+        "execution_mode": EXECUTION_MODE,
+    }
+    if any(oracle.get(key) != value for key, value in expected_contract.items()):
+        raise RunnerError("Wine oracle did not prove the fixed normal-boundary contract")
+    processed_size, processed_hash = output_identity(output / "processed.u8")
+    loaded_size, loaded_hash = output_identity(output / "loaded-before-match.bin")
+    matched_size, matched_hash = output_identity(output / "after-match.bin")
+    studied_size, studied_hash = output_identity(output / "after-study.bin")
+    persistent_size, persistent_hash = output_identity(output / "next-persistent.bin")
+    probe_size, probe_hash = output_identity(output / "probe-template.bin")
+    _, expected_loaded_hash = output_identity(template)
+    if (processed_size != 108 * 88 or probe_size <= 1433 or
+            loaded_hash != expected_loaded_hash):
+        raise RunnerError("Wine oracle preprocessing or loaded-template identity differs")
+    identify = require_object(oracle.get("identify"), "Wine identify result")
+    study = require_object(oracle.get("study"), "Wine study result")
+    queue = require_object(oracle.get("queue"), "Wine queue result")
+    matched = identify.get("matched_index") == 0
+    if (identify.get("status") != 0 or
+            identify.get("matched_index") not in {0, UINT32_MAX} or
+            matched != (identify.get("score", 0) > 0)):
+        raise RunnerError("Wine identify score, decision, or index is inconsistent")
+    if (lifecycle["preprocess"] != {"attempted": True, "completed": True} or
+            lifecycle["extraction"] != {"attempted": True, "completed": True}):
+        raise RunnerError("Wine preprocess or extraction lifecycle is inconsistent")
+    expected_called = matched
+    study_action = study.get("update")
+    if (study.get("called") is not expected_called or
+            (expected_called and
+             (not isinstance(study_action, int) or isinstance(study_action, bool) or
+              not 0 <= study_action <= 5)) or
+            (not expected_called and study_action is not None)):
+        raise RunnerError("Wine study call or update code is inconsistent")
+    if (lifecycle["study"] != {"attempted": expected_called,
+                               "completed": expected_called}):
+        raise RunnerError("Wine study lifecycle is inconsistent")
+    advanced = expected_called and study_action > 0
+    queue_values = [queue.get("occupied_before_match"),
+                    queue.get("occupied_after_match_before_study")]
+    if (any(not isinstance(value, int) or isinstance(value, bool) or
+            not 0 <= value <= 20 for value in queue_values) or
+            (queue.get("occupied_after_study") is not None and
+             (not isinstance(queue["occupied_after_study"], int) or
+              isinstance(queue["occupied_after_study"], bool) or
+              not 0 <= queue["occupied_after_study"] <= 20)) or
+            (expected_called != (queue.get("occupied_after_study") is not None))):
+        raise RunnerError("Wine natural queue observations are invalid")
+    if oracle.get("persistence_advanced") is not advanced:
+        raise RunnerError("Wine persistence gate is inconsistent")
+    if advanced:
+        if (persistent_size, persistent_hash) != (studied_size, studied_hash):
+            raise RunnerError("positive study update did not advance persistence")
+    elif (persistent_size, persistent_hash) != (loaded_size, loaded_hash):
+        raise RunnerError("non-positive study update changed persistence")
+
+    phases = [
+        {"name": "stage-01-preprocess",
+         "outputs": {"coverage_i32": preprocess["coverage"],
+                     "processed_image_sha256": processed_hash,
+                     "quality_i32": preprocess["quality"],
+                     "status_i32": preprocess["status"]}},
+        {"name": "stage-01-extract-antifake",
+         "outputs": {"active_record_count_u32": oracle["active_record_count"],
+                     "partition0_count_u32": oracle["partition0_count"],
+                     "partition1_count_u32": oracle["partition1_count"],
+                     "probe_record_count_u32": oracle["active_record_count"],
+                     "probe_template_sha256": probe_hash}},
+        {"name": "stage-01-study",
+         "outputs": {"final_candidate_sha256": persistent_hash if advanced else None,
+                      "study_action_u32": study_action}},
+    ]
+    accepted = matched
+    status = 0 if accepted else 1
+    record = {
+        "schema": RECORD_SCHEMA,
+        "case_id": case["id"],
+        "execution_mode": EXECUTION_MODE,
+        "policy": POLICY,
+        "phases": phases,
+        "result": {
+            "accepted": accepted,
+            "final_candidate_sha256": persistent_hash if advanced else None,
+            "gallery": [{"accepted": accepted,
+                         "after_match_sha256": matched_hash,
+                         "evaluated": True,
+                         "gallery_index_u32": gallery_index,
+                          "gallery_position_u64": 0,
+                          "queue_occupied_after_match_u64":
+                              queue["occupied_after_match_before_study"],
+                          "queue_occupied_after_study_u64":
+                              queue["occupied_after_study"],
+                          "queue_occupied_before_match_u64":
+                              queue["occupied_before_match"],
+                          "score_i32": identify["score"], "valid": True}],
+            "lifecycle": lifecycle,
+            "score_i32": identify["score"], "status_u32": status,
+            "study_action_u32": study_action,
+            "winner_index_u32": gallery_index if accepted else UINT32_MAX,
+            "winner_position_u32": 0 if accepted else UINT32_MAX,
+        },
+    }
+    return validate_record(record, case["id"], "native DLL record")
+
+
+def run_dll_authority_batch(executable: Path, wine: str, jobs, dll: Path):
+    if not jobs:
+        return []
+    prefixes = {wine_prefix(native) for _, native, _ in jobs}
+    if len(prefixes) != 1:
+        raise RunnerError("batched authority jobs must use one Wine prefix")
+    prefix = prefixes.pop()
+    lock_path = cache_root() / ("wine-prefix-" + hashlib.sha256(
+        str(prefix).encode("utf-8")).hexdigest() + ".lock")
+    work_parent = cache_root() / "work"
+    work_parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock, tempfile.TemporaryDirectory(
+            prefix="milan-parity-native-batch-", dir=work_parent) as temporary_value:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        temporary = Path(temporary_value).resolve()
+        outputs = []
+        lines = []
+        for position, (case, _, inputs) in enumerate(jobs):
+            setup, preludes, live, template, _ = inputs
+            output = temporary / f"output-{position:04d}"
+            output.mkdir(mode=0o700)
+            outputs.append(output)
+            fields = [windows_path(output), windows_path(setup), windows_path(live),
+                       windows_path(template)]
+            # Preserve captured words through the CLI; the oracle models the
+            # sample adapter's byte projection only at the algorithm call.
+            fields.extend(str(case["replay"][field]) for field in CALIBRATION_FIELDS)
+            fields.extend(f"{purpose}:{windows_path(prelude)}"
+                          for prelude, purpose in preludes)
+            if any("\t" in field or "\r" in field or "\n" in field for field in fields):
+                raise RunnerError("batch authority paths contain unsupported control characters")
+            lines.append("\t".join(fields))
+        manifest = temporary / "manifest.tsv"
+        manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        environment = os.environ.copy()
+        environment.update({
+            "WINEPREFIX": str(prefix),
+            "WINEARCH": "win64",
+            "WINEDEBUG": "-all",
+            "WINEDLLOVERRIDES": "winemenubuilder.exe=d",
+        })
+        command = [wine, windows_path(executable), "batch", windows_path(dll),
+                   windows_path(manifest)]
+        process = subprocess.run(command, env=environment, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, check=False, timeout=3600)
+        if process.returncode:
+            diagnostic = process.stderr.decode("utf-8", "replace").strip()
+            message = (f"Wine DLL batch authority failed with status "
+                       f"{process.returncode}: {diagnostic}")
+            terminal = re.search(
+                r"(?:^|\r?\n)batch replay failed at line ([0-9]+)\Z", diagnostic)
+            if terminal:
+                line_number = int(terminal.group(1))
+                if 1 <= line_number <= len(jobs):
+                    failed_case, _, failed_inputs = jobs[line_number - 1]
+                    message += (f"; transient case {failed_case['id']}"
+                                f" gallery_index_u32={failed_inputs[4]}")
+                else:
+                    message += (f"; batch failure line {line_number} is outside "
+                                f"the {len(jobs)} active jobs")
+            raise RunnerError(message)
+        return [record_from_output(output, case, inputs)
+                for output, (case, _, inputs) in zip(outputs, jobs)]
+
+
+def combine_gallery_records(case, records):
+    if not records:
+        raise RunnerError("native DLL gallery produced no records")
+    if not records[0]["result"]["lifecycle"]["preprocess"]["completed"]:
+        if len(records) != 1 or records[0]["result"]["gallery"]:
+            raise RunnerError("native preprocessing retry reached gallery evaluation")
+        return records[0]
+    accepted_position = next((position for position, record in enumerate(records)
+                              if record["result"]["accepted"]), None)
+    if accepted_position is not None:
+        records = records[:accepted_position + 1]
+    phases = records[0]["phases"][:2] + records[-1]["phases"][2:]
+    for record in records[1:]:
+        if record["phases"][:2] != records[0]["phases"][:2]:
+            raise RunnerError("fresh controlled-zero probe phases differ across gallery rows")
+    gallery = []
+    for position, record in enumerate(records):
+        row = dict(record["result"]["gallery"][0])
+        row["gallery_position_u64"] = position
+        gallery.append(row)
+    winner_position = next((position for position, row in enumerate(gallery)
+                            if row["accepted"]), UINT32_MAX)
+    final = records[-1]["result"]
+    final["gallery"] = gallery
+    final["winner_position_u32"] = winner_position
+    if winner_position == UINT32_MAX:
+        final["winner_index_u32"] = UINT32_MAX
+    return validate_record({"schema": RECORD_SCHEMA, "case_id": case["id"],
+                             "execution_mode": EXECUTION_MODE, "policy": POLICY,
+                             "phases": phases, "result": final},
+                           case["id"], "native DLL gallery record")
+
+
+def run_dll_gallery(executable: Path, wine: str, case, native, entries, dll: Path):
+    records = []
+    for entry in entries:
+        record = run_dll_authority_batch(
+            executable, wine, [(case, native, entry)], dll)[0]
+        records.append(record)
+        if (record["result"]["accepted"] or
+                not record["result"]["lifecycle"]["preprocess"]["completed"]):
+            break
+    return combine_gallery_records(case, records)
+
+
+def run_batch_authority(executable: Path, wine: str, batch_path: Path, dll: Path):
+    batch = require_object(load_canonical(batch_path, "native batch"), "native batch")
+    descriptors = batch.get("jobs")
+    if (batch.get("schema") != NATIVE_BATCH_SCHEMA or
+            not isinstance(descriptors, list) or not descriptors or len(descriptors) > 4096):
+        raise RunnerError("native batch schema or jobs are invalid")
+    if not dll.is_file() or dll.is_symlink():
+        raise RunnerError("explicit DLL is unavailable for native batch")
+    dll_digest = sha256_file(dll)
+    cases = []
+    for position, descriptor in enumerate(descriptors):
+        descriptor = require_object(descriptor, f"native batch job {position}")
+        root_value = descriptor.get("corpus")
+        case_id = descriptor.get("case")
+        if not isinstance(root_value, str) or not isinstance(case_id, str):
+            raise RunnerError(f"native batch job {position} is missing corpus or case")
+        root = Path(root_value).expanduser().resolve()
+        case, verified = load_case(root, case_id)
+        _, native, entries = native_contract(case, verified)
+        if native["dll_sha256"] != dll_digest:
+            raise RunnerError("native batch job DLL identity differs")
+        cases.append((case, native, entries))
+    records_by_case = [[] for _ in cases]
+    for gallery_position in range(max(len(entries) for _, _, entries in cases)):
+        jobs = []
+        job_cases = []
+        for case_position, (case, native, entries) in enumerate(cases):
+            if (gallery_position >= len(entries) or
+                    (records_by_case[case_position] and
+                     (records_by_case[case_position][-1]["result"]["accepted"] or
+                      not records_by_case[case_position][-1]["result"]
+                      ["lifecycle"]["preprocess"]["completed"]))):
+                continue
+            jobs.append((case, native, entries[gallery_position]))
+            job_cases.append(case_position)
+        for case_position, record in zip(
+                job_cases, run_dll_authority_batch(executable, wine, jobs, dll)):
+            records_by_case[case_position].append(record)
+    combined = [combine_gallery_records(case, records)
+                for (case, _, _), records in zip(cases, records_by_case)]
+    return {"schema": NATIVE_BATCH_SCHEMA, "records": combined}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="native-runner")
+    parser.add_argument("--corpus")
+    parser.add_argument("--case")
+    parser.add_argument("--batch")
+    parser.add_argument("--dll")
+    parser.add_argument("--provenance", action="store_true")
+    parser.add_argument("--require-existing-backend", action="store_true")
+    parser.add_argument("--expected-native-source-sha256")
+    parser.add_argument("--expected-native-build-sha256")
+    parser.add_argument("--expected-provenance-schema")
+    parser.add_argument("--expected-execution-mode")
+    parser.add_argument("--expected-policy-sha256")
+    parser.add_argument("--expected-dll-sha256")
+    parser.add_argument("--expected-architecture")
+    parser.add_argument("--expected-authority-commit")
+    parser.add_argument("--expected-wine-version")
+    args = parser.parse_args()
+
+    tool = Path(__file__).resolve().parent
+    expected_values = (
+        args.expected_native_source_sha256, args.expected_native_build_sha256,
+        args.expected_provenance_schema, args.expected_execution_mode,
+        args.expected_policy_sha256, args.expected_dll_sha256,
+        args.expected_architecture, args.expected_authority_commit,
+        args.expected_wine_version)
+    if args.provenance:
+        if args.corpus or args.case or args.batch or any(expected_values):
+            raise RunnerError("--provenance does not accept corpus, case, or batch")
+        sys.stdout.buffer.write(canonical(provenance(
+            tool, args.dll, build_backend=not args.require_existing_backend)))
+        return 0
+    if args.require_existing_backend:
+        raise RunnerError("--require-existing-backend requires --provenance")
+    if args.batch:
+        if args.corpus or args.case or not args.dll or not all(expected_values):
+            raise RunnerError(
+                "--batch requires its batch, DLL, and complete expected native identity")
+        dll = Path(args.dll).expanduser().resolve()
+        expected_source = require_digest(
+            args.expected_native_source_sha256, "expected native source SHA-256")
+        expected_build = require_digest(
+            args.expected_native_build_sha256, "expected native build SHA-256")
+        expected_policy = require_digest(
+            args.expected_policy_sha256, "expected native policy SHA-256")
+        expected_dll = require_digest(args.expected_dll_sha256, "expected DLL SHA-256")
+        if args.expected_provenance_schema != NATIVE_PROVENANCE_SCHEMA:
+            raise RunnerError("expected native provenance schema differs")
+        if args.expected_execution_mode != EXECUTION_MODE:
+            raise RunnerError("expected native execution mode differs")
+        if args.expected_architecture != "win64-x86_64":
+            raise RunnerError("expected native architecture differs")
+        if args.expected_authority_commit != AUTHORITY_COMMIT:
+            raise RunnerError("expected native authority commit differs")
+        if expected_policy != hashlib.sha256(canonical(POLICY)).hexdigest():
+            raise RunnerError("expected native policy differs")
+        verify_dll(dll, expected_dll)
+        if native_source_sha256(tool) != expected_source:
+            raise RunnerError("native source SHA-256 differs from pinned provenance")
+        executable = backend_executable(tool, build=False)
+        if sha256_file(executable) != expected_build:
+            raise RunnerError("native build SHA-256 differs from pinned provenance")
+        wine, _ = wine_executable(args.expected_wine_version)
+        result = run_batch_authority(
+            executable, wine, Path(args.batch).expanduser().resolve(), dll)
+        sys.stdout.buffer.write(canonical(result))
+        return 0
+    if any(expected_values):
+        raise RunnerError("expected native identity arguments are valid only with --batch")
+    if not args.corpus or not args.case or not args.dll:
+        raise RunnerError("--corpus, --case, and --dll are required")
+
+    root = Path(args.corpus).expanduser().resolve()
+    dll = Path(args.dll).expanduser().resolve()
+    case, verified = load_case(root, args.case)
+    _, native, inputs = native_contract(case, verified)
+    verify_dll(dll, native["dll_sha256"])
+    executable = backend_executable(tool, build=False)
+    wine, _ = wine_executable()
+    record = run_dll_gallery(executable, wine, case, native, inputs, dll)
+    sys.stdout.buffer.write(canonical(record))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (RunnerError, OSError, subprocess.SubprocessError) as error:
+        print(f"native runner: {error}", file=sys.stderr)
+        raise SystemExit(2)
